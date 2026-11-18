@@ -1,0 +1,275 @@
+name: Build UnitConverter APK from v2rayNG release
+
+on:
+  # GitHub Actions cannot subscribe to another repository's release event.  Poll
+  # the official Releases API once per 24 hours instead.
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Optional official 2dust/v2rayNG release tag, for example 2.3.15"
+        required: false
+        type: string
+      rebuild:
+        description: "Rebuild and replace assets for an existing release in this repository"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+# Do not let a delayed daily trigger and a manual trigger publish the same tag
+# concurrently.  Completed releases are detected again inside the job.
+concurrency:
+  group: unitconverter-v2rayng-release
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    env:
+      APP_KEYSTORE_BASE64: ${{ secrets.APP_KEYSTORE_BASE64 }}
+      APP_KEYSTORE_PASSWORD: ${{ secrets.APP_KEYSTORE_PASSWORD }}
+      APP_KEY_ALIAS: ${{ secrets.APP_KEY_ALIAS }}
+      APP_KEY_PASSWORD: ${{ secrets.APP_KEY_PASSWORD }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      # This checkout supplies the locked rebranding script; the app source is
+      # cloned at the exact official release tag below.
+      - name: Checkout automation repository
+        uses: actions/checkout@v7
+
+      - name: Detect official release and local release state
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          upstream_tag='${{ inputs.upstream_tag }}'
+          if [[ -z "$upstream_tag" ]]; then
+            upstream_tag="$(gh api repos/2dust/v2rayNG/releases/latest --jq '.tag_name')"
+          fi
+          [[ -n "$upstream_tag" && "$upstream_tag" != "null" ]]
+
+          # v2rayNG's in-app updater strips a leading v and then parses every
+          # dot-separated part as an integer.  Keep our release tag numeric.
+          release_tag="v${upstream_tag#v}"
+          echo "upstream_tag=$upstream_tag" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+          if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+             && [[ '${{ inputs.rebuild }}' != 'true' ]]; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "Release $release_tag already exists; nothing to do."
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report already-published release
+        if: steps.release.outputs.should_build != 'true'
+        run: echo "No new official release to build."
+
+      - name: Check required signing secrets
+        if: steps.release.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in APP_KEYSTORE_BASE64 APP_KEYSTORE_PASSWORD APP_KEY_ALIAS APP_KEY_PASSWORD; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing repository secret: $name"
+              exit 1
+            fi
+          done
+
+      - name: Clone the exact upstream release with submodules
+        if: steps.release.outputs.should_build == 'true'
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_dir="$RUNNER_TEMP/v2rayNG"
+          git clone --branch '${{ steps.release.outputs.upstream_tag }}' --recurse-submodules \
+            https://github.com/2dust/v2rayNG.git "$source_dir"
+
+          version_name="$(sed -nE 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"([0-9.]+)"/\1/p' "$source_dir/V2rayNG/app/build.gradle.kts" | head -n 1)"
+          [[ -n "$version_name" ]]
+          expected_release_tag="v${version_name#v}"
+          if [[ "$expected_release_tag" != '${{ steps.release.outputs.release_tag }}' ]]; then
+            echo "::error::Official tag ${{ steps.release.outputs.upstream_tag }} and versionName $version_name are incompatible with the in-app numeric updater."
+            exit 1
+          fi
+          echo "source_dir=$source_dir" >> "$GITHUB_OUTPUT"
+          echo "version_name=$version_name" >> "$GITHUB_OUTPUT"
+
+      - name: Rebrand source safely
+        if: steps.release.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/.github/scripts/rebrand-v2rayng.py" \
+            '${{ steps.source.outputs.source_dir }}' \
+            --release-repository "$GITHUB_REPOSITORY"
+
+      # The patch, source manifest, and GPL text are release assets so a user
+      # can reconstruct the corresponding source from the public upstream tag.
+      - name: Save corresponding-source patch
+        if: steps.release.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_dir='${{ steps.source.outputs.source_dir }}'
+          artifact_dir="$RUNNER_TEMP/release-assets"
+          mkdir -p "$artifact_dir"
+          git -C "$source_dir" diff --binary > "$artifact_dir/unitconverter_${{ steps.source.outputs.version_name }}_source.patch"
+          git -C "$source_dir" rev-parse HEAD > "$artifact_dir/upstream-commit.txt"
+          jq -n \
+            --arg upstream_repository "2dust/v2rayNG" \
+            --arg upstream_tag '${{ steps.release.outputs.upstream_tag }}' \
+            --arg upstream_commit "$(cat "$artifact_dir/upstream-commit.txt")" \
+            --arg package_name "com.tools.unitconverter" \
+            --arg release_repository "$GITHUB_REPOSITORY" \
+            --arg automation_commit "$GITHUB_SHA" \
+            --arg rebranding_script ".github/scripts/rebrand-v2rayng.py" \
+            '{upstream_repository: $upstream_repository, upstream_tag: $upstream_tag, upstream_commit: $upstream_commit, package_name: $package_name, release_repository: $release_repository, automation_commit: $automation_commit, rebranding_script: $rebranding_script}' \
+            > "$artifact_dir/SOURCE-MANIFEST.json"
+          cp "$source_dir/LICENSE" "$artifact_dir/LICENSE"
+
+      - name: Set up Android SDK
+        if: steps.release.outputs.should_build == 'true'
+        uses: android-actions/setup-android@v4
+        with:
+          log-accepted-android-sdk-licenses: false
+          cmdline-tools-version: "14742923"
+          packages: "platforms;android-37.0 build-tools;37.0.0 platform-tools"
+
+      - name: Install Android NDK
+        if: steps.release.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "y" | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --channel=0 --install "ndk;30.0.16248370"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
+
+          build_file='${{ steps.source.outputs.source_dir }}/V2rayNG/app/build.gradle.kts'
+          if ! grep -q 'ndkVersion[[:space:]]*=' "$build_file"; then
+            sed -i '/compileSdk[[:space:]]*=/a\    ndkVersion = "30.0.16248370"' "$build_file"
+          fi
+
+      - name: Build only the arm64 HEV tunnel libraries
+        if: steps.release.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_dir='${{ steps.source.outputs.source_dir }}'
+          sed -i 's/^ABIS=".*"$/ABIS="arm64-v8a"/' "$source_dir/compile-hevtun.sh"
+          (cd "$source_dir" && bash compile-hevtun.sh)
+          cp -r "$source_dir/libs" "$source_dir/V2rayNG/app/"
+
+      - name: Download the matching Xray core AAR
+        if: steps.release.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_dir='${{ steps.source.outputs.source_dir }}'
+          core_tag="$(git -C "$source_dir/AndroidLibXrayLite" describe --tags --abbrev=0)"
+          mkdir -p "$source_dir/V2rayNG/app/libs"
+          gh release download "$core_tag" --repo 2dust/AndroidLibXrayLite \
+            --pattern libv2ray.aar --dir "$source_dir/V2rayNG/app/libs"
+
+      - name: Set up Java 21
+        if: steps.release.outputs.should_build == 'true'
+        uses: actions/setup-java@v6.1.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Decode signing key
+        if: steps.release.outputs.should_build == 'true'
+        id: keystore
+        shell: bash
+        run: |
+          set -euo pipefail
+          keystore_path="$RUNNER_TEMP/unitconverter-release.jks"
+          printf '%s' "$APP_KEYSTORE_BASE64" | base64 --decode > "$keystore_path"
+          echo "path=$keystore_path" >> "$GITHUB_OUTPUT"
+
+      - name: Build signed arm64-v8a Play Store APK
+        if: steps.release.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_dir='${{ steps.source.outputs.source_dir }}/V2rayNG'
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > "$app_dir/local.properties"
+          chmod 755 "$app_dir/gradlew"
+          (
+            cd "$app_dir"
+            ./gradlew licenseFdroidReleaseReport
+            ./gradlew assemblePlaystoreRelease -PABI_FILTERS=arm64-v8a \
+              -Pandroid.injected.signing.store.file='${{ steps.keystore.outputs.path }}' \
+              -Pandroid.injected.signing.store.password="$APP_KEYSTORE_PASSWORD" \
+              -Pandroid.injected.signing.key.alias="$APP_KEY_ALIAS" \
+              -Pandroid.injected.signing.key.password="$APP_KEY_PASSWORD"
+          )
+
+      - name: Verify package, signature, ABI, and native libraries
+        if: steps.release.outputs.should_build == 'true'
+        id: apk
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_dir='${{ steps.source.outputs.source_dir }}/V2rayNG'
+          mapfile -t apks < <(find "$app_dir/app/build/outputs/apk/playstore/release" -type f -name '*arm64-v8a*.apk')
+          [[ "${#apks[@]}" -eq 1 ]]
+          apk="${apks[0]}"
+
+          "$ANDROID_HOME/build-tools/37.0.0/aapt" dump badging "$apk" | grep -F "package: name='com.tools.unitconverter'"
+          "$ANDROID_HOME/build-tools/37.0.0/apksigner" verify --verbose --print-certs "$apk"
+          for library in libhev-socks5-tunnel.so libhevsockstun.so libgojni.so; do
+            unzip -Z1 "$apk" | grep -Fx "lib/arm64-v8a/$library"
+          done
+          if unzip -Z1 "$apk" | grep -q '^lib/armeabi-v7a/\|^lib/x86/\|^lib/x86_64/'; then
+            echo "::error::APK contains an ABI other than arm64-v8a"
+            exit 1
+          fi
+          echo "path=$apk" >> "$GITHUB_OUTPUT"
+
+      - name: Stage release assets
+        if: steps.release.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_dir="$RUNNER_TEMP/release-assets"
+          apk_name="unitconverter_${{ steps.source.outputs.version_name }}_arm64-v8a.apk"
+          cp '${{ steps.apk.outputs.path }}' "$artifact_dir/$apk_name"
+          (
+            cd "$artifact_dir"
+            sha256sum "$apk_name" > "${apk_name}.sha256"
+          )
+
+      - name: Publish to this repository's GitHub Releases
+        if: steps.release.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_dir="$RUNNER_TEMP/release-assets"
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          cat > "$notes_file" <<EOF
+          Automated, arm64-v8a-only build of [2dust/v2rayNG ${{ steps.release.outputs.upstream_tag }}](https://github.com/2dust/v2rayNG/releases/tag/${{ steps.release.outputs.upstream_tag }}).
+
+          Package: \`com.tools.unitconverter\`
+
+          Signed with this repository's Android signing key.  \`SOURCE-MANIFEST.json\`, the source patch, and \`LICENSE\` describe the corresponding GPL source.
+          EOF
+
+          if gh release view '${{ steps.release.outputs.release_tag }}' --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload '${{ steps.release.outputs.release_tag }}' "$artifact_dir"/* \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create '${{ steps.release.outputs.release_tag }}' "$artifact_dir"/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "UnitConverter ${{ steps.source.outputs.version_name }}" \
+              --notes-file "$notes_file"
+          fi
